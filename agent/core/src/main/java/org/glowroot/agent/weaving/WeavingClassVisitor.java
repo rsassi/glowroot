@@ -18,6 +18,7 @@ package org.glowroot.agent.weaving;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
@@ -632,20 +633,77 @@ class WeavingClassVisitor extends ClassVisitor {
             exceptions[i] = ClassNames.toInternalName(inheritedMethod.exceptions().get(i));
         }
         List<Advice> advisors = removeSuperseded(inheritedMethod.advisors());
+
+        // Use resolved types for the overridden method signature to handle specialized generics
+        String signature4Child = inheritedMethod.signatureResolved() != null
+                ? inheritedMethod.signatureResolved()
+                : inheritedMethod.signature();
+        String returnType4Child = inheritedMethod.returnTypeResolved() != null
+                ? inheritedMethod.returnTypeResolved()
+                : inheritedMethod.returnType();
+
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, inheritedMethod.name(),
-                inheritedMethod.getDesc(), inheritedMethod.signature(), exceptions);
+                inheritedMethod.getDescResolved(), signature4Child, exceptions);
         mv = visitMethodWithAdvice(mv, ACC_PUBLIC, inheritedMethod.name(),
-                inheritedMethod.getDesc(), advisors);
+                inheritedMethod.getDescResolved(), advisors);
         checkNotNull(mv);
         GeneratorAdapter mg = new GeneratorAdapter(mv, ACC_PUBLIC, inheritedMethod.name(),
-                inheritedMethod.getDesc());
+                inheritedMethod.getDescResolved());
+
         mg.visitCode();
         mg.loadThis();
         mg.loadArgs();
         Type superType = Type.getObjectType(ClassNames.toInternalName(superName));
         // method is called invokeConstructor, but should really be called invokeSpecial
+        // Use the original (unresolved) descriptor for the super call since the parent class
+        // method has the generic signature
         Method method = new Method(inheritedMethod.name(), inheritedMethod.getDesc());
         mg.invokeConstructor(superType, method);
+
+        // Cast the return value if types differ (generic specialization case)
+        Type superReturnType = Type.getReturnType(inheritedMethod.getDesc());
+        Type resolvedReturnType = AnalyzedMethod.getType(returnType4Child);
+        if (!Objects.equals(superReturnType, resolvedReturnType)) {
+            // Use raw MethodVisitor for try-catch to ensure proper frame generation
+            Label tryStart = new Label();
+            Label tryEnd = new Label();
+            Label catchStart = new Label();
+            Label afterCatch = new Label();
+
+            mv.visitTryCatchBlock(tryStart, tryEnd, catchStart, "java/lang/ClassCastException");
+
+            // Try block
+            mv.visitLabel(tryStart);
+            mg.checkCast(resolvedReturnType);
+            mv.visitLabel(tryEnd);
+            mv.visitJumpInsn(GOTO, afterCatch);
+
+            // Catch block
+            mv.visitLabel(catchStart);
+            mv.visitFrame(F_NEW, 1, new Object[]{type.getInternalName()}, 1,
+                    new Object[]{"java/lang/ClassCastException"});
+            mv.visitInsn(DUP);
+
+            // System.out.println("Failed to cast...")
+            mv.visitFieldInsn(GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+            mv.visitLdcInsn("Failed to cast return type from " + superReturnType.getClassName()
+                    + " to " + resolvedReturnType.getClassName()
+                    + " in method " + type.getClassName() + "." + inheritedMethod.name());
+            mv.visitMethodInsn(INVOKEVIRTUAL, "java/io/PrintStream", "println",
+                    "(Ljava/lang/String;)V", false);
+
+            // exception.printStackTrace()
+            mv.visitInsn(DUP);
+            mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/Throwable", "printStackTrace", "()V", false);
+
+            // Re-throw
+            mv.visitInsn(ATHROW);
+
+            mv.visitLabel(afterCatch);
+            mv.visitFrame(F_NEW, 1, new Object[]{type.getInternalName()}, 1,
+                    new Object[]{resolvedReturnType.getInternalName()});
+        }
+
         mg.returnValue();
         mg.endMethod();
     }
